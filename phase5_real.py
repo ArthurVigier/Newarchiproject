@@ -9,17 +9,6 @@ import tempfile
 import json
 import re
 from datasets import load_dataset
-import itertools
-import inspect
-
-# Patch pour compatibilité transformers récente et GLM-4
-# Résout l'erreur 'all_tied_weights_keys'
-_orig_getattr = nn.Module.__getattr__
-def _patched_getattr(self, name):
-    if name == "all_tied_weights_keys":
-        return {} 
-    return _orig_getattr(self, name)
-nn.Module.__getattr__ = _patched_getattr
 
 # Configuration du chemin pour les modules locaux
 sys.path.append(os.getcwd())
@@ -32,7 +21,7 @@ except ImportError as e:
     sys.exit(1)
 
 class ScrupulousArchitecture(nn.Module):
-    def __init__(self, llm_hidden_dim=4096, latent_dim=512, num_experts=3):
+    def __init__(self, llm_hidden_dim=5120, latent_dim=512, num_experts=3):
         super().__init__()
         self.encoder = StochasticTextEncoder(input_dim=llm_hidden_dim, latent_dim=latent_dim)
         self.moe = SurvivalMoE(latent_dim=latent_dim, num_experts=num_experts)
@@ -41,7 +30,7 @@ class ScrupulousArchitecture(nn.Module):
     def forward(self, h_t):
         z_t, sigreg_loss = self.encoder(h_t)
         z_expert = self.moe(z_t)
-        soft_token = self.projector(z_expert) # Renvoie (batch, 1, dim)
+        soft_token = self.projector(z_expert)
         return soft_token, sigreg_loss
 
 def execute_lcb_reward(generated_code: str, input_output: str, timeout=5) -> float:
@@ -111,86 +100,30 @@ def load_mixed_datasets():
     print(f"Loaded {len(ds_code)} Code problems and {len(ds_math)} Math problems.")
     return ds_code, ds_math
 
-def run_phase5_glm():
+def run_phase5_qwen():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_experts = 3
     
-    model_name = "THUDM/glm-4-9b-chat"
-    print(f"Loading Base LLM: {model_name} (Frozen)")
+    # Qwen2.5-Coder-32B est natif dans transformers (pas de trust_remote_code nécessaire)
+    # C'est le Sweet Spot absolu pour une A100 80GB (tient en BF16 avec du contexte)
+    model_name = "Qwen/Qwen2.5-Coder-32B-Instruct"
+    print(f"Loading Native SOTA Base LLM: {model_name} (Frozen)")
     
-    from transformers import AutoConfig
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    
-    # --- SUPER PATCH CONFIG GLM-4 ---
-    # Résout 'use_cache', 'max_length', etc.
-    config_patches = {
-        'max_length': getattr(config, 'seq_length', 131072),
-        'use_cache': True,
-        'is_encoder_decoder': False,
-        'output_hidden_states': True,
-        'return_dict': True,
-        'tie_word_embeddings': False,
-        'chunk_size_feed_forward': 0,
-        'pruned_heads': {},
-        'output_attentions': False
-    }
-    for key, value in config_patches.items():
-        if not hasattr(config, key):
-            setattr(config, key, value)
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     llm_model = AutoModelForCausalLM.from_pretrained(
         model_name, 
-        config=config,
         device_map="auto", 
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True
+        torch_dtype=torch.bfloat16
     )
-    
-    # --- MONKEY PATCH POUR generate(inputs_embeds=...) ---
-    # 1. Forcer la signature du forward pour inclure explicitement 'inputs_embeds'
-    # Sinon transformers.generation.utils lève une ValueError
-    old_forward = llm_model.forward
-    def patched_forward(input_ids=None, attention_mask=None, inputs_embeds=None, **kwargs):
-        if inputs_embeds is not None and input_ids is None:
-            return old_forward(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
-        return old_forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-    
-    # On remplace la méthode et on s'assure que transformers "voit" le support
-    llm_model.forward = patched_forward
-    llm_model._can_generate_with_inputs_embeds = True # Flag interne parfois vérifié
-
-    # 2. Patcher prepare_inputs_for_generation
-    # GLM-4 d'origine ne sait pas passer inputs_embeds au forward suivant s'il est présent
-    old_prepare = llm_model.prepare_inputs_for_generation
-    def patched_prepare(input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs):
-        if inputs_embeds is not None and past_key_values is None:
-            # Premier step : utiliser les embeddings
-            model_inputs = {"inputs_embeds": inputs_embeds, "past_key_values": None}
-        else:
-            # Steps suivants : utiliser les tokens normaux (input_ids[:, -1:])
-            model_inputs = old_prepare(input_ids, past_key_values=past_key_values, attention_mask=attention_mask, **kwargs)
-        
-        # S'assurer que attention_mask est transmis
-        if attention_mask is not None:
-            model_inputs["attention_mask"] = attention_mask
-        return model_inputs
-    
-    llm_model.prepare_inputs_for_generation = patched_prepare
-
-    # 3. Supprimer max_length pour la validation de generate()
-    if hasattr(llm_model.config, 'max_length'):
-        delattr(llm_model.config, 'max_length')
-    # ----------------------------------------------------
     
     llm_model.eval()
     for param in llm_model.parameters():
         param.requires_grad = False
         
-    llm_hidden_dim = llm_model.config.hidden_size
+    llm_hidden_dim = llm_model.config.hidden_size # 5120
     LAYER_IDX = 9 
 
-    print("Initializing Scrupulous Experimental Architecture...")
+    print(f"Initializing Scrupulous Experimental Architecture (Hidden Dim: {llm_hidden_dim})...")
     archi = ScrupulousArchitecture(llm_hidden_dim=llm_hidden_dim, latent_dim=512, num_experts=num_experts).to(device)
     
     backprop_params = list(archi.encoder.parameters()) + \
@@ -227,16 +160,15 @@ def run_phase5_glm():
             h_t = outputs.hidden_states[LAYER_IDX][:, -1, :].to(torch.float32)
             
         optimizer.zero_grad()
-        soft_token, sigreg_loss = archi(h_t) # soft_token: (batch, 1, 4096)
+        soft_token, sigreg_loss = archi(h_t)
         
         active_expert = archi.moe._last_selected_experts[0].item()
         expert_usage[task_type][active_expert] += 1
         
         with torch.no_grad():
             word_embeddings = llm_model.get_input_embeddings()
-            text_embeds = word_embeddings(inputs["input_ids"]) # (1, seq, 4096)
+            text_embeds = word_embeddings(inputs["input_ids"])
             
-            # On s'assure que soft_token est en dimension 3 (batch, 1, dim)
             soft_token_bf16 = soft_token.to(dtype=torch.bfloat16)
             if soft_token_bf16.dim() == 2:
                 soft_token_bf16 = soft_token_bf16.unsqueeze(1)
@@ -244,10 +176,10 @@ def run_phase5_glm():
                 soft_token_bf16 = soft_token_bf16.squeeze(1)
             
             inputs_embeds = torch.cat([soft_token_bf16, text_embeds], dim=1)
-            
             extra_mask = torch.ones((1, 1), dtype=inputs["attention_mask"].dtype, device=device)
             extended_mask = torch.cat([extra_mask, inputs["attention_mask"]], dim=1)
             
+            # Plus besoin de patcher generate, Qwen supporte inputs_embeds nativement
             gen_outputs = llm_model.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=extended_mask,
@@ -279,4 +211,4 @@ def run_phase5_glm():
             print(f"  - Math Routed to Experts: {expert_usage['math']}")
 
 if __name__ == '__main__':
-    run_phase5_glm()
+    run_phase5_qwen()
