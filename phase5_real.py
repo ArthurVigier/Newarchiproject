@@ -23,70 +23,58 @@ except ImportError as e:
 class ScrupulousArchitecture(nn.Module):
     def __init__(self, llm_hidden_dim=5120, latent_dim=512, num_experts=3):
         super().__init__()
-        # 1. Encodeur Stochastique (SIGReg intégré)
         self.encoder = StochasticTextEncoder(input_dim=llm_hidden_dim, latent_dim=latent_dim)
-        
-        # 2. Router Entropique + Experts à Survie Darwinienne
         self.moe = SurvivalMoE(latent_dim=latent_dim, num_experts=num_experts)
-        
-        # 3. Projecteur Introspectif (Entraîné par backprop)
         self.projector = IntrospectionProjector(latent_dim=latent_dim, llm_embedding_dim=llm_hidden_dim)
 
     def forward(self, h_t):
-        # A. Encodage avec SIGReg
         z_t, sigreg_loss = self.encoder(h_t)
-        
-        # B. Routing Entropique et Traitement par Expert Survivaliste
         z_expert = self.moe(z_t)
-        
-        # C. Projection vers l'espace d'embedding du LLM
-        soft_token = self.projector(z_expert) # (batch, 1, dim)
-        
+        soft_token = self.projector(z_expert)
         return soft_token, sigreg_loss
 
-def execute_lcb_reward(generated_code: str, input_output: str, timeout=5) -> float:
-    """Reward binaire (Code) - exécution sandbox"""
+def execute_lcb_reward(generated_code: str, test_cases_str: str, timeout=5) -> float:
+    """Reward binaire (Code) - Exécution stdin/stdout depuis public_test_cases"""
     if "```python" in generated_code:
         generated_code = generated_code.split("```python")[1].split("```")[0]
     elif "```" in generated_code:
         generated_code = generated_code.split("```")[1].split("```")[0]
 
     try:
-        io_data = json.loads(input_output)
-        test_script = generated_code + "\n\nimport json\n"
-        test_script += f"inputs = {io_data.get('inputs', [])}\n"
-        test_script += f"expected_outputs = {io_data.get('outputs', [])}\n"
-        test_script += f"fn_name = '{io_data.get('fn_name', '')}'\n"
-        test_script += """
-if fn_name and fn_name in globals():
-    func = globals()[fn_name]
-    for i in range(len(inputs)):
-        inp = inputs[i]
-        expected = expected_outputs[i]
-        res = func(*inp) if isinstance(inp, list) else func(inp)
-        if res != expected:
-            import sys
-            sys.exit(1)
-    print("All tests passed!")
-else:
-    import sys
-    sys.exit(1)
-"""
+        test_cases = json.loads(test_cases_str)
+        if not isinstance(test_cases, list) or len(test_cases) == 0:
+            return -1.0
     except Exception:
         return -1.0
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(test_script)
+        f.write(generated_code)
         temp_filename = f.name
         
+    reward = 1.0
     try:
-        result = subprocess.run([sys.executable, temp_filename], capture_output=True, timeout=timeout, text=True)
-        reward = 1.0 if (result.returncode == 0 and "All tests passed!" in result.stdout) else -1.0
+        for tc in test_cases[:3]: # Limiter à 3 tests rapides pour la boucle
+            inp = tc.get("input", "")
+            expected_out = tc.get("output", "").strip()
+            
+            result = subprocess.run(
+                [sys.executable, temp_filename], 
+                input=inp,
+                capture_output=True, 
+                timeout=timeout, 
+                text=True
+            )
+            
+            # Comparaison stricte avec la sortie standard
+            if result.returncode != 0 or result.stdout.strip() != expected_out:
+                reward = -1.0
+                break
     except Exception:
         reward = -1.0
     finally:
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
+            
     return reward
 
 def execute_math_reward(generated_text: str, target_str: str) -> float:
@@ -156,7 +144,7 @@ def run_phase5_qwen():
     for step, (task_type, data) in enumerate(mixed_generator()):
         if task_type == "code":
             prompt_text = data["question_content"]
-            sys_msg = "You are an expert Python programmer. Solve the task with a function. Output code only."
+            sys_msg = "You are an expert Python programmer. Solve the task by reading from stdin and writing to stdout. Output code only."
         else:
             prompt_text = data["question"]
             sys_msg = "You are an expert mathematician. Solve the problem step by step and end with the final number."
@@ -208,7 +196,8 @@ def run_phase5_qwen():
             
         # 4. Évaluation
         if task_type == "code":
-            reward = execute_lcb_reward(generated_text, data["input_output"])
+            # Mise à jour : LiveCodeBench utilise 'public_test_cases'
+            reward = execute_lcb_reward(generated_text, data["public_test_cases"])
         else:
             reward = execute_math_reward(generated_text, data["answer"])
         
