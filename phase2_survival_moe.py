@@ -164,19 +164,20 @@ class SurvivalMoE(nn.Module):
         super().__init__()
         # Redefining LatentPredictor here to ensure it uses LayerNorm for Phase 5 batch_size=1
         class LocalLatentPredictor(nn.Module):
-            def __init__(self, latent_dim=512, hidden_dim=2048):
+            def __init__(self, latent_dim=512, hidden_dim=2048, dropout=0.1):
                 super().__init__()
                 self.net = nn.Sequential(
                     nn.Linear(latent_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim), # Replacing BatchNorm1d
+                    nn.LayerNorm(hidden_dim), 
                     nn.GELU(),
+                    nn.Dropout(dropout),
                     nn.Linear(hidden_dim, latent_dim)
                 )
             def forward(self, z):
                 return self.net(z)
 
         self.predictors = nn.ModuleList([
-            LocalLatentPredictor(latent_dim=latent_dim, hidden_dim=2048) 
+            LocalLatentPredictor(latent_dim=latent_dim, hidden_dim=2048, dropout=0.1) 
             for _ in range(num_experts)
         ])
         
