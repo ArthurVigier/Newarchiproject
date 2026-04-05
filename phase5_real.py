@@ -10,12 +10,14 @@ import json
 import re
 from datasets import load_dataset
 import itertools
+import inspect
 
 # Patch pour compatibilité transformers récente et GLM-4
+# Résout l'erreur 'all_tied_weights_keys'
 _orig_getattr = nn.Module.__getattr__
 def _patched_getattr(self, name):
     if name == "all_tied_weights_keys":
-        return {} # Doit être un dictionnaire, pas une liste !
+        return {} 
     return _orig_getattr(self, name)
 nn.Module.__getattr__ = _patched_getattr
 
@@ -39,7 +41,7 @@ class ScrupulousArchitecture(nn.Module):
     def forward(self, h_t):
         z_t, sigreg_loss = self.encoder(h_t)
         z_expert = self.moe(z_t)
-        soft_token = self.projector(z_expert)
+        soft_token = self.projector(z_expert) # Renvoie (batch, 1, dim)
         return soft_token, sigreg_loss
 
 def execute_lcb_reward(generated_code: str, input_output: str, timeout=5) -> float:
@@ -90,18 +92,12 @@ else:
 def execute_math_reward(generated_text: str, target_str: str) -> float:
     """Reward binaire (Maths) - Exact match sur la réponse finale"""
     try:
-        # GSM8K ground truth a le format "... #### 123"
         target_ans = target_str.split("####")[-1].strip()
         target_val = float(target_ans.replace(',', ''))
-        
-        # Extraction de tous les nombres générés par le modèle
         gen_nums = re.findall(r'-?\d+(?:\.\d+)?', generated_text.replace(',', ''))
         if not gen_nums:
             return -1.0
-            
-        # On suppose que la dernière valeur générée est la réponse finale
         gen_val = float(gen_nums[-1])
-        
         if abs(gen_val - target_val) < 1e-5:
             return 1.0
         return -1.0
@@ -126,8 +122,7 @@ def run_phase5_glm():
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     
     # --- SUPER PATCH CONFIG GLM-4 ---
-    # Anticipation de tous les attributs manquants dans ChatGLMConfig
-    # exigés par les versions récentes de transformers (GenerationMixin, forward_impl)
+    # Résout 'use_cache', 'max_length', etc.
     config_patches = {
         'max_length': getattr(config, 'seq_length', 131072),
         'use_cache': True,
@@ -139,11 +134,9 @@ def run_phase5_glm():
         'pruned_heads': {},
         'output_attentions': False
     }
-    
     for key, value in config_patches.items():
         if not hasattr(config, key):
             setattr(config, key, value)
-    # --------------------------------
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     llm_model = AutoModelForCausalLM.from_pretrained(
@@ -154,12 +147,41 @@ def run_phase5_glm():
         trust_remote_code=True
     )
     
-    # --- NETTOYAGE POST-CHARGEMENT ---
-    # On supprime max_length du config pour éviter que generate() ne râle,
-    # car il a déjà été utilisé par le code distant pendant l'init.
+    # --- MONKEY PATCH POUR generate(inputs_embeds=...) ---
+    # 1. Forcer la signature du forward pour inclure explicitement 'inputs_embeds'
+    # Sinon transformers.generation.utils lève une ValueError
+    old_forward = llm_model.forward
+    def patched_forward(input_ids=None, attention_mask=None, inputs_embeds=None, **kwargs):
+        if inputs_embeds is not None and input_ids is None:
+            return old_forward(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
+        return old_forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+    
+    # On remplace la méthode et on s'assure que transformers "voit" le support
+    llm_model.forward = patched_forward
+    llm_model._can_generate_with_inputs_embeds = True # Flag interne parfois vérifié
+
+    # 2. Patcher prepare_inputs_for_generation
+    # GLM-4 d'origine ne sait pas passer inputs_embeds au forward suivant s'il est présent
+    old_prepare = llm_model.prepare_inputs_for_generation
+    def patched_prepare(input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs):
+        if inputs_embeds is not None and past_key_values is None:
+            # Premier step : utiliser les embeddings
+            model_inputs = {"inputs_embeds": inputs_embeds, "past_key_values": None}
+        else:
+            # Steps suivants : utiliser les tokens normaux (input_ids[:, -1:])
+            model_inputs = old_prepare(input_ids, past_key_values=past_key_values, attention_mask=attention_mask, **kwargs)
+        
+        # S'assurer que attention_mask est transmis
+        if attention_mask is not None:
+            model_inputs["attention_mask"] = attention_mask
+        return model_inputs
+    
+    llm_model.prepare_inputs_for_generation = patched_prepare
+
+    # 3. Supprimer max_length pour la validation de generate()
     if hasattr(llm_model.config, 'max_length'):
         delattr(llm_model.config, 'max_length')
-    # ---------------------------------
+    # ----------------------------------------------------
     
     llm_model.eval()
     for param in llm_model.parameters():
@@ -180,10 +202,8 @@ def run_phase5_glm():
     
     print("\nStarting Double Learning Loop with Mixed Curriculum (Code + Math)...")
     
-    # Tracking de spécialisation
     expert_usage = {"code": [0]*num_experts, "math": [0]*num_experts}
     
-    # Générateur alterné
     def mixed_generator():
         for code_data, math_data in zip(ds_code, ds_math):
             yield ("code", code_data)
@@ -207,27 +227,24 @@ def run_phase5_glm():
             h_t = outputs.hidden_states[LAYER_IDX][:, -1, :].to(torch.float32)
             
         optimizer.zero_grad()
-        soft_token, sigreg_loss = archi(h_t) # soft_token: (batch_size, 1, llm_hidden_dim) defined in Phase 4 Projector
+        soft_token, sigreg_loss = archi(h_t) # soft_token: (batch, 1, 4096)
         
-        # Tracking MoE
         active_expert = archi.moe._last_selected_experts[0].item()
         expert_usage[task_type][active_expert] += 1
         
         with torch.no_grad():
             word_embeddings = llm_model.get_input_embeddings()
-            text_embeds = word_embeddings(inputs["input_ids"]) # (batch, seq, dim)
+            text_embeds = word_embeddings(inputs["input_ids"]) # (1, seq, 4096)
             
-            # IntrospectionProjector returns (batch, 1, 4096)
-            # In phase5_real.py, we previously did .unsqueeze(1) which made it (batch, 1, 1, 4096) -> 4 dims!
-            # We need to make sure it's strictly (batch, 1, dim) to concat with text_embeds
-            if soft_token.dim() == 2:
-                soft_token_bf16 = soft_token.to(dtype=torch.bfloat16).unsqueeze(1)
-            elif soft_token.dim() == 3:
-                soft_token_bf16 = soft_token.to(dtype=torch.bfloat16)
-            elif soft_token.dim() == 4:
-                soft_token_bf16 = soft_token.squeeze(1).to(dtype=torch.bfloat16)
+            # On s'assure que soft_token est en dimension 3 (batch, 1, dim)
+            soft_token_bf16 = soft_token.to(dtype=torch.bfloat16)
+            if soft_token_bf16.dim() == 2:
+                soft_token_bf16 = soft_token_bf16.unsqueeze(1)
+            elif soft_token_bf16.dim() == 4:
+                soft_token_bf16 = soft_token_bf16.squeeze(1)
             
             inputs_embeds = torch.cat([soft_token_bf16, text_embeds], dim=1)
+            
             extra_mask = torch.ones((1, 1), dtype=inputs["attention_mask"].dtype, device=device)
             extended_mask = torch.cat([extra_mask, inputs["attention_mask"]], dim=1)
             
@@ -242,19 +259,16 @@ def run_phase5_glm():
             generated_ids = gen_outputs[0][inputs_embeds.shape[1]:]
             generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             
-        # Évaluation Binaire Externe
         if task_type == "code":
             reward = execute_lcb_reward(generated_text, data["input_output"])
         else:
             reward = execute_math_reward(generated_text, data["answer"])
         
-        # BOUCLE A : Backprop
         policy_loss = -reward * torch.mean(soft_token**2) 
         total_loss = policy_loss + 0.1 * sigreg_loss
         total_loss.backward()
         optimizer.step()
         
-        # BOUCLE B : Survie
         archi.moe.distribute_reward(reward)
         
         if (step + 1) % 10 == 0:
