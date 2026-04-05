@@ -130,7 +130,8 @@ def load_triple_datasets():
     print("Loading Triple Curriculum Datasets (Code + Math + ARC)...")
     ds_code = load_dataset("livecodebench/code_generation", split="test")
     ds_math = load_dataset("openai/gsm8k", "main", split="test")
-    ds_arc = load_dataset("barc0/ARC", split="test")
+    # Dataset officiel ARC de François Chollet
+    ds_arc = load_dataset("fchollet/ARC", split="test")
     return ds_code, ds_math, ds_arc
 
 def run_phase6_zero_backprop():
@@ -170,6 +171,7 @@ def run_phase6_zero_backprop():
         elif task_type == "math":
             prompt, sys_msg = data["question"], "You are an expert mathematician. Solve the problem step by step and end with #### number."
         else:
+            # Adaptation structure fchollet/ARC
             prompt, sys_msg = f"Solve this ARC puzzle. Input: {data['train']}", "Output only the predicted JSON grid [[...]]."
             
         messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
@@ -196,7 +198,7 @@ def run_phase6_zero_backprop():
             
         if task_type == "code": reward = execute_lcb_reward(generated_text, data["public_test_cases"])
         elif task_type == "math": reward = execute_math_reward(generated_text, data["answer"])
-        else: reward = execute_arc_reward(generated_text, json.dumps(data['test']))
+        else: reward = execute_arc_reward(generated_text, json.dumps(data['test'][0]['output'])) # fchollet/ARC
 
         archi.evolution_step(reward)
         archi.moe.distribute_reward(reward)
