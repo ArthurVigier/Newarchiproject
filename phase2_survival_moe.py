@@ -136,7 +136,7 @@ class SurvivalExpert(nn.Module):
             self.dormancy_counters[active_mask] = 0
         else:
             self.survival_scores[active_mask] -= 0.5
-            self.dormancy_counters[active_mask] += 2
+            self.dormancy_counters[active_expert_mask] += 2
             
         # 2. Le silence augmente la dormance
         self.dormancy_counters[silent_mask] += 1
@@ -162,11 +162,21 @@ class SurvivalExpert(nn.Module):
 class SurvivalMoE(nn.Module):
     def __init__(self, latent_dim=512, num_experts=3):
         super().__init__()
-        # Le routeur a besoin de prédicteurs entraînés par backprop
-        # On simule ici des prédicteurs très légers pour le routing
-        from phase1_encoder import LatentPredictor
+        # Redefining LatentPredictor here to ensure it uses LayerNorm for Phase 5 batch_size=1
+        class LocalLatentPredictor(nn.Module):
+            def __init__(self, latent_dim=512, hidden_dim=2048):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(latent_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim), # Replacing BatchNorm1d
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, latent_dim)
+                )
+            def forward(self, z):
+                return self.net(z)
+
         self.predictors = nn.ModuleList([
-            LatentPredictor(latent_dim=latent_dim, hidden_dim=2048) 
+            LocalLatentPredictor(latent_dim=latent_dim, hidden_dim=2048) 
             for _ in range(num_experts)
         ])
         
