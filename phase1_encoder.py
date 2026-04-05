@@ -18,9 +18,11 @@ except ImportError:
 class StochasticTextEncoder(nn.Module):
     def __init__(self, input_dim=4096, latent_dim=512, dropout=0.1, num_proj=1024):
         super().__init__()
+        # Replacing BatchNorm1d with LayerNorm to handle batch_size=1 gracefully
+        # during sequential generation/RL loops
         self.proj = nn.Sequential(
             nn.Linear(input_dim, latent_dim),
-            nn.BatchNorm1d(latent_dim),
+            nn.LayerNorm(latent_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
