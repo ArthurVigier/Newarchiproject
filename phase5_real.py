@@ -23,14 +23,25 @@ except ImportError as e:
 class ScrupulousArchitecture(nn.Module):
     def __init__(self, llm_hidden_dim=5120, latent_dim=512, num_experts=3):
         super().__init__()
+        # 1. Encodeur Stochastique (SIGReg intégré)
         self.encoder = StochasticTextEncoder(input_dim=llm_hidden_dim, latent_dim=latent_dim)
+        
+        # 2. Router Entropique + Experts à Survie Darwinienne
         self.moe = SurvivalMoE(latent_dim=latent_dim, num_experts=num_experts)
+        
+        # 3. Projecteur Introspectif (Entraîné par backprop)
         self.projector = IntrospectionProjector(latent_dim=latent_dim, llm_embedding_dim=llm_hidden_dim)
 
     def forward(self, h_t):
+        # A. Encodage avec SIGReg
         z_t, sigreg_loss = self.encoder(h_t)
+        
+        # B. Routing Entropique et Traitement par Expert Survivaliste
         z_expert = self.moe(z_t)
-        soft_token = self.projector(z_expert)
+        
+        # C. Projection vers l'espace d'embedding du LLM
+        soft_token = self.projector(z_expert) # (batch, 1, dim)
+        
         return soft_token, sigreg_loss
 
 def execute_lcb_reward(generated_code: str, input_output: str, timeout=5) -> float:
@@ -104,9 +115,9 @@ def run_phase5_qwen():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_experts = 3
     
-    # Qwen3.5-Coder-32B est le SOTA absolu en avril 2026
-    model_name = "Qwen/Qwen3.5-Coder-32B-Instruct"
-    print(f"Loading Native SOTA Base LLM: {model_name} (Frozen)")
+    # Qwen2.5-Coder-32B : supporté nativement sans aucun patch
+    model_name = "Qwen/Qwen2.5-Coder-32B-Instruct"
+    print(f"Loading Base LLM: {model_name} (Frozen)")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     llm_model = AutoModelForCausalLM.from_pretrained(
@@ -120,11 +131,12 @@ def run_phase5_qwen():
         param.requires_grad = False
         
     llm_hidden_dim = llm_model.config.hidden_size # 5120
-    LAYER_IDX = 9 
+    LAYER_IDX = 9 # Couche d'intérêt spécifiée par Arthur
 
     print(f"Initializing Scrupulous Experimental Architecture (Hidden Dim: {llm_hidden_dim})...")
     archi = ScrupulousArchitecture(llm_hidden_dim=llm_hidden_dim, latent_dim=512, num_experts=num_experts).to(device)
     
+    # Backprop sur l'infrastructure uniquement
     backprop_params = list(archi.encoder.parameters()) + \
                       list(archi.projector.parameters()) + \
                       list(archi.moe.predictors.parameters())
@@ -154,21 +166,26 @@ def run_phase5_qwen():
         full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(full_prompt, return_tensors="pt").to(device)
         
+        # 1. Extraction des activations
         with torch.no_grad():
             outputs = llm_model(**inputs, output_hidden_states=True)
             h_t = outputs.hidden_states[LAYER_IDX][:, -1, :].to(torch.float32)
             
+        # 2. Pipeline Architecture Expérimentale
         optimizer.zero_grad()
         soft_token, sigreg_loss = archi(h_t)
         
+        # Tracking MoE
         active_expert = archi.moe._last_selected_experts[0].item()
         expert_usage[task_type][active_expert] += 1
         
+        # 3. Injection Introspective (Token en position 0)
         with torch.no_grad():
             word_embeddings = llm_model.get_input_embeddings()
             text_embeds = word_embeddings(inputs["input_ids"])
             
             soft_token_bf16 = soft_token.to(dtype=torch.bfloat16)
+            # Sécurité dimensionnelle
             if soft_token_bf16.dim() == 2:
                 soft_token_bf16 = soft_token_bf16.unsqueeze(1)
             elif soft_token_bf16.dim() == 4:
@@ -178,7 +195,6 @@ def run_phase5_qwen():
             extra_mask = torch.ones((1, 1), dtype=inputs["attention_mask"].dtype, device=device)
             extended_mask = torch.cat([extra_mask, inputs["attention_mask"]], dim=1)
             
-            # Plus besoin de patcher generate, Qwen supporte inputs_embeds nativement
             gen_outputs = llm_model.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=extended_mask,
@@ -190,16 +206,19 @@ def run_phase5_qwen():
             generated_ids = gen_outputs[0][inputs_embeds.shape[1]:]
             generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             
+        # 4. Évaluation
         if task_type == "code":
             reward = execute_lcb_reward(generated_text, data["input_output"])
         else:
             reward = execute_math_reward(generated_text, data["answer"])
         
+        # 5. BOUCLE A : Backprop (Encoder + Projector)
         policy_loss = -reward * torch.mean(soft_token**2) 
         total_loss = policy_loss + 0.1 * sigreg_loss
         total_loss.backward()
         optimizer.step()
         
+        # 6. BOUCLE B : Survie Darwinienne (Experts)
         archi.moe.distribute_reward(reward)
         
         if (step + 1) % 10 == 0:
