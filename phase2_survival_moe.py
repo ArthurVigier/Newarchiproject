@@ -136,7 +136,7 @@ class SurvivalExpert(nn.Module):
             self.dormancy_counters[active_mask] = 0
         else:
             self.survival_scores[active_mask] -= 0.5
-            self.dormancy_counters[active_expert_mask] += 2
+            self.dormancy_counters[active_mask] += 2
             
         # 2. Le silence augmente la dormance
         self.dormancy_counters[silent_mask] += 1
