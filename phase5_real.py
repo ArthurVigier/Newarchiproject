@@ -199,7 +199,7 @@ def run_phase5_glm():
             h_t = outputs.hidden_states[LAYER_IDX][:, -1, :].to(torch.float32)
             
         optimizer.zero_grad()
-        soft_token, sigreg_loss = archi(h_t)
+        soft_token, sigreg_loss = archi(h_t) # soft_token: (batch_size, 1, llm_hidden_dim) defined in Phase 4 Projector
         
         # Tracking MoE
         active_expert = archi.moe._last_selected_experts[0].item()
@@ -207,8 +207,17 @@ def run_phase5_glm():
         
         with torch.no_grad():
             word_embeddings = llm_model.get_input_embeddings()
-            text_embeds = word_embeddings(inputs["input_ids"])
-            soft_token_bf16 = soft_token.to(dtype=torch.bfloat16).unsqueeze(1)
+            text_embeds = word_embeddings(inputs["input_ids"]) # (batch, seq, dim)
+            
+            # IntrospectionProjector returns (batch, 1, 4096)
+            # In phase5_real.py, we previously did .unsqueeze(1) which made it (batch, 1, 1, 4096) -> 4 dims!
+            # We need to make sure it's strictly (batch, 1, dim) to concat with text_embeds
+            if soft_token.dim() == 2:
+                soft_token_bf16 = soft_token.to(dtype=torch.bfloat16).unsqueeze(1)
+            elif soft_token.dim() == 3:
+                soft_token_bf16 = soft_token.to(dtype=torch.bfloat16)
+            elif soft_token.dim() == 4:
+                soft_token_bf16 = soft_token.squeeze(1).to(dtype=torch.bfloat16)
             
             inputs_embeds = torch.cat([soft_token_bf16, text_embeds], dim=1)
             extra_mask = torch.ones((1, 1), dtype=inputs["attention_mask"].dtype, device=device)
