@@ -7,7 +7,6 @@ import os
 import subprocess
 import tempfile
 import json
-import urllib.request
 
 sys.path.append(os.getcwd())
 try:
@@ -25,20 +24,57 @@ class FullArchitecture(nn.Module):
         self.moe = SurvivalMoE(latent_dim=latent_dim, num_experts=num_experts)
         self.projector = IntrospectionProjector(latent_dim=latent_dim, llm_embedding_dim=llm_hidden_dim)
 
-def execute_and_reward(generated_code: str, test_assertions: list, timeout=5) -> float:
+def execute_lcb_reward(generated_code: str, input_output: str, timeout=5) -> float:
     """
-    Exécute le code généré dans un bac à sable (subprocess) avec les tests unitaires.
-    Retourne +1.0 si tous les tests passent, -1.0 en cas d'échec, erreur ou timeout.
+    Exécute le code généré contre les tests unitaires fournis par LiveCodeBench.
+    LiveCodeBench fournit souvent les I/O sous forme de string JSON qu'il faut parser.
     """
-    # Nettoyage basique du markdown généré par le LLM
     if "```python" in generated_code:
         generated_code = generated_code.split("```python")[1].split("```")[0]
     elif "```" in generated_code:
         generated_code = generated_code.split("```")[1].split("```")[0]
 
+    # Construction du script de test
+    # LiveCodeBench fournit généralement un dictionnaire 'inputs' et 'outputs'
+    # Nous créons un script de test local pour exécuter ces assertions.
+    test_script = generated_code + "\n\n"
+    
+    try:
+        io_data = json.loads(input_output)
+        test_script += "import json\n"
+        test_script += f"inputs = {io_data.get('inputs', [])}\n"
+        test_script += f"expected_outputs = {io_data.get('outputs', [])}\n"
+        test_script += f"fn_name = '{io_data.get('fn_name', '')}'\n"
+        
+        # Test runner statique ajouté à la volée
+        test_script += """
+if fn_name and fn_name in globals():
+    func = globals()[fn_name]
+    for i in range(len(inputs)):
+        # Handle varargs vs normal args based on type
+        inp = inputs[i]
+        expected = expected_outputs[i]
+        if isinstance(inp, list):
+            res = func(*inp)
+        else:
+            res = func(inp)
+            
+        if res != expected:
+            print(f"Test failed: input {inp}, expected {expected}, got {res}")
+            import sys
+            sys.exit(1)
+    print("All tests passed!")
+else:
+    print("Function not found!")
+    import sys
+    sys.exit(1)
+"""
+    except Exception as e:
+        # Fallback if json parsing fails
+        return -1.0
+
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(generated_code + "\n\n")
-        f.write("\n".join(test_assertions))
+        f.write(test_script)
         temp_filename = f.name
         
     try:
@@ -48,12 +84,12 @@ def execute_and_reward(generated_code: str, test_assertions: list, timeout=5) ->
             timeout=timeout,
             text=True
         )
-        if result.returncode == 0:
-            reward = 1.0  # Succès total
+        if result.returncode == 0 and "All tests passed!" in result.stdout:
+            reward = 1.0  
         else:
-            reward = -1.0 # Erreur d'exécution ou test échoué
+            reward = -1.0 
     except subprocess.TimeoutExpired:
-        reward = -1.0 # Boucle infinie
+        reward = -1.0 
     except Exception:
         reward = -1.0
     finally:
@@ -62,26 +98,23 @@ def execute_and_reward(generated_code: str, test_assertions: list, timeout=5) ->
             
     return reward
 
-def load_mbpp_dataset(limit=500):
+def load_livecodebench_dataset():
     """
-    Charge le dataset MBPP (Mostly Basic Python Problems) de Google Research.
-    Très similaire à BigCodeBench en termes de structure (Prompt + Tests unitaires).
+    Charge la version allégée/test de LiveCodeBench depuis HuggingFace.
+    Nécessite la librairie 'datasets'.
     """
-    url = "https://raw.githubusercontent.com/google-research/google-research/master/mbpp/mbpp.jsonl"
-    print("Downloading dataset (MBPP)...")
-    dataset = []
     try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req) as response:
-            for line in response:
-                obj = json.loads(line)
-                dataset.append(obj)
-                if len(dataset) >= limit:
-                    break
-        print(f"Loaded {len(dataset)} problems.")
-    except Exception as e:
-        print(f"Could not load MBPP: {e}")
-    return dataset
+        from datasets import load_dataset
+    except ImportError:
+        print("Please install datasets: pip install datasets")
+        sys.exit(1)
+        
+    print("Downloading dataset (LiveCodeBench)...")
+    # On utilise la version de test pour avoir les problèmes récents (sans contamination)
+    # Note: On limite au split test pour aller vite sur ce script
+    ds = load_dataset("livecodebench/code_generation", split="test")
+    print(f"Loaded {len(ds)} LiveCodeBench problems.")
+    return ds
 
 def run_real_phase5():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -110,14 +143,14 @@ def run_real_phase5():
     optimizer = optim.AdamW([p for p in archi.parameters() if p.requires_grad], lr=5e-5)
     LAYER_IDX = 9 
     
-    dataset = load_mbpp_dataset(limit=1000) # Charger 1000 problèmes
+    dataset = load_livecodebench_dataset()
     
-    print("\nStarting REAL Training Loop...")
+    print("\nStarting REAL Training Loop with LiveCodeBench...")
     metrics_history = []
     
     for step, data in enumerate(dataset):
-        prompt_text = data["text"]
-        test_list = data["test_list"]
+        prompt_text = data["question_content"]
+        input_output_str = data["input_output"] # JSON string des I/O
         
         # Format the prompt as expected by instruction-tuned Qwen
         sys_prompt = "You are an expert Python programmer. Write the Python function to solve the following task. Only output valid Python code, no explanations."
@@ -148,22 +181,19 @@ def run_real_phase5():
             gen_outputs = llm_model.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=extended_mask,
-                max_new_tokens=200, # Vraie génération de code
+                max_new_tokens=300, # Vraie génération de code
                 pad_token_id=tokenizer.eos_token_id,
                 temperature=0.2, # Low temp pour le code
                 do_sample=True
             )
-            # Ne récupérer que la partie générée (ignorer le prompt)
             generated_ids = gen_outputs[0][inputs_embeds.shape[1] - 1:]
             generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             
-        # Evaluate using real subprocess Sandbox
-        reward = execute_and_reward(generated_text, test_list)
+        # Evaluate using real subprocess Sandbox against LiveCodeBench I/O
+        reward = execute_lcb_reward(generated_text, input_output_str)
         metrics_history.append(1 if reward > 0 else 0)
         
         # Double Update 
-        # Loss policy classique: -reward * (norme du token / ou sortie du projecteur)
-        # Ceci force le projecteur à "pousser" plus fort si le code est bon
         policy_loss = -reward * soft_token.norm() 
         total_loss = policy_loss + 0.1 * sigreg_loss
         total_loss.backward()
@@ -173,11 +203,12 @@ def run_real_phase5():
         # Darwinian update on MoE
         archi.moe.distribute_reward(reward)
         
-        if (step + 1) % 10 == 0:
-            recent_acc = sum(metrics_history[-10:]) / 10.0
-            print(f"Step {step+1:4d} | Recent Acc: {recent_acc*100:.1f}% | Loss: {total_loss.item():.4f}")
+        if (step + 1) % 5 == 0:
+            recent_acc = sum(metrics_history[-10:]) / min(10, len(metrics_history))
+            print(f"Step {step+1:4d} | Recent Acc: {recent_acc*100:.1f}% | Reward: {reward:2.0f} | Loss: {total_loss.item():.4f}")
 
     print("\nReal Phase 5 Training Completed.")
 
 if __name__ == '__main__':
     run_real_phase5()
+
