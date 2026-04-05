@@ -153,6 +153,14 @@ def run_phase5_glm():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True
     )
+    
+    # --- NETTOYAGE POST-CHARGEMENT ---
+    # On supprime max_length du config pour éviter que generate() ne râle,
+    # car il a déjà été utilisé par le code distant pendant l'init.
+    if hasattr(llm_model.config, 'max_length'):
+        delattr(llm_model.config, 'max_length')
+    # ---------------------------------
+    
     llm_model.eval()
     for param in llm_model.parameters():
         param.requires_grad = False
