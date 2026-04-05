@@ -11,6 +11,14 @@ import re
 from datasets import load_dataset
 import itertools
 
+# Patch pour compatibilité transformers récente et GLM-4
+_orig_getattr = nn.Module.__getattr__
+def _patched_getattr(self, name):
+    if name == "all_tied_weights_keys":
+        return []
+    return _orig_getattr(self, name)
+nn.Module.__getattr__ = _patched_getattr
+
 # Configuration du chemin pour les modules locaux
 sys.path.append(os.getcwd())
 try:
