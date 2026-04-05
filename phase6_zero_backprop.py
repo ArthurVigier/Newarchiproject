@@ -24,7 +24,6 @@ class ZeroBackpropArchitecture(nn.Module):
     """Architecture 100% Darwinienne/Evolutionnaire. AUCUN GRADIENT."""
     def __init__(self, llm_hidden_dim=5120, latent_dim=512, num_experts=3):
         super().__init__()
-        # On désactive explicitement les gradients pour tous les paramètres
         self.encoder = StochasticTextEncoder(input_dim=llm_hidden_dim, latent_dim=latent_dim)
         for p in self.encoder.parameters(): p.requires_grad = False
             
@@ -33,11 +32,8 @@ class ZeroBackpropArchitecture(nn.Module):
         self.projector = IntrospectionProjector(latent_dim=latent_dim, llm_embedding_dim=llm_hidden_dim)
         for p in self.projector.parameters(): p.requires_grad = False
             
-        # Paramètres d'évolution (Evolution Strategies)
-        self.noise_std = 0.02     # Taille du pas de mutation
-        self.learning_rate = 0.1  # Force de mise à jour après succès
-        
-        # Stockage de la dernière mutation appliquée
+        self.noise_std = 0.02
+        self.learning_rate = 0.1
         self._last_mutation = []
 
     def forward(self, h_t):
@@ -48,7 +44,6 @@ class ZeroBackpropArchitecture(nn.Module):
 
     @torch.no_grad()
     def mutate(self):
-        """Applique une perturbation gaussienne aléatoire."""
         self._last_mutation = []
         for p in list(self.encoder.parameters()) + list(self.projector.parameters()):
             noise = torch.randn_like(p) * self.noise_std
@@ -57,13 +52,10 @@ class ZeroBackpropArchitecture(nn.Module):
 
     @torch.no_grad()
     def evolution_step(self, reward: float):
-        """Met à jour l'architecture basée sur le reward."""
         if reward > 0:
-            # Succès : on renforce la mutation
             for p, noise in self._last_mutation:
                 p.add_(noise * self.learning_rate)
         else:
-            # Échec : on annule la mutation
             if self._last_mutation:
                 for p, noise in self._last_mutation:
                     p.sub_(noise)
@@ -85,16 +77,21 @@ class ZeroBackpropArchitecture(nn.Module):
             return checkpoint['step'], checkpoint['expert_usage']
         return 0, None
 
-# --- SANDBOX EXECUTIONS ---
+# --- PURE CODE SANDBOX EXECUTIONS ---
+def extract_code(text: str) -> str:
+    if "```python" in text: return text.split("```python")[1].split("```")[0]
+    elif "```" in text: return text.split("```")[1].split("```")[0]
+    return text
+
 def execute_lcb_reward(generated_code: str, test_cases_str: str, timeout=5) -> float:
-    if "```python" in generated_code: generated_code = generated_code.split("```python")[1].split("```")[0]
-    elif "```" in generated_code: generated_code = generated_code.split("```")[1].split("```")[0]
+    """Sandbox for LiveCodeBench (stdin/stdout)"""
+    code = extract_code(generated_code)
     try:
         test_cases = json.loads(test_cases_str)
         if not test_cases: return -1.0
     except: return -1.0
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(generated_code)
+        f.write(code)
         temp_filename = f.name
     reward = 1.0
     try:
@@ -107,35 +104,31 @@ def execute_lcb_reward(generated_code: str, test_cases_str: str, timeout=5) -> f
         if os.path.exists(temp_filename): os.remove(temp_filename)
     return reward
 
-def execute_math_reward(generated_text: str, target_str: str) -> float:
+def execute_mbpp_reward(generated_code: str, assertions: list, timeout=5) -> float:
+    """Sandbox for MBPP (Python Assertions)"""
+    code = extract_code(generated_code)
+    # On ajoute les assertions à la fin du code généré
+    full_script = code + "\n\n" + "\n".join(assertions) + "\nprint('OK')"
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(full_script)
+        temp_filename = f.name
+        
     try:
-        target_ans = target_str.split("####")[-1].strip()
-        target_val = float(target_ans.replace(',', ''))
-        gen_nums = re.findall(r'-?\d+(?:\.\d+)?', generated_text.replace(',', ''))
-        if not gen_nums: return -1.0
-        gen_val = float(gen_nums[-1])
-        if abs(gen_val - target_val) < 1e-5: return 1.0
-        return -1.0
-    except Exception: return -1.0
-
-def execute_ai2_arc_reward(generated_text: str, correct_answer_key: str) -> float:
-    """Reward pour allenai/ai2_arc (choix multiple)"""
-    try:
-        gen = generated_text.strip().upper()
-        # On cherche la lettre de la réponse isolée
-        match = re.search(r'\b' + correct_answer_key + r'\b', gen)
-        if match: return 1.0
+        result = subprocess.run([sys.executable, temp_filename], capture_output=True, timeout=timeout, text=True)
+        if result.returncode == 0 and "OK" in result.stdout:
+            return 1.0
         return -1.0
     except: return -1.0
+    finally:
+        if os.path.exists(temp_filename): os.remove(temp_filename)
 
-def load_triple_datasets():
-    print("Loading Triple Curriculum Datasets (Code + Math + AI2_ARC)...")
-    ds_code = load_dataset("livecodebench/code_generation", split="test")
-    ds_math = load_dataset("openai/gsm8k", "main", split="test")
-    # AI2 ARC Challenge
-    ds_arc = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test")
-    print(f"Loaded {len(ds_code)} Code, {len(ds_math)} Math, {len(ds_arc)} ARC problems.")
-    return ds_code, ds_math, ds_arc
+def load_code_datasets():
+    print("Loading PURE CODE Curriculum Datasets (LiveCodeBench + MBPP)...")
+    ds_lcb = load_dataset("livecodebench/code_generation", split="test")
+    ds_mbpp = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
+    print(f"Loaded {len(ds_lcb)} Algorithmic problems (LCB) and {len(ds_mbpp)} Python Base problems (MBPP).")
+    return ds_lcb, ds_mbpp
 
 def run_phase6_zero_backprop():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -150,38 +143,35 @@ def run_phase6_zero_backprop():
     llm_hidden_dim = llm_model.config.hidden_size # 5120
     LAYER_IDX = 9
 
-    print("Initializing 100% Zero-Backprop Evolutionary Architecture...")
+    print("Initializing 100% Zero-Backprop Evolutionary Architecture (PURE CODE FOCUS)...")
     archi = ZeroBackpropArchitecture(llm_hidden_dim=llm_hidden_dim, latent_dim=512, num_experts=num_experts).to(device)
     
-    ds_code, ds_math, ds_arc = load_triple_datasets()
-    expert_usage = {"code": [0]*num_experts, "math": [0]*num_experts, "arc": [0]*num_experts}
+    ds_lcb, ds_mbpp = load_code_datasets()
+    expert_usage = {"lcb": [0]*num_experts, "mbpp": [0]*num_experts}
     
     os.makedirs("/workspace/checkpoints", exist_ok=True)
-    checkpoint_path = "/workspace/checkpoints/phase6_latest.pt"
+    checkpoint_path = "/workspace/checkpoints/phase6_pure_code_latest.pt"
     start_step, saved_usage = archi.load_checkpoint(checkpoint_path)
     if saved_usage: expert_usage = saved_usage
     
-    def triple_generator():
-        combined = zip(ds_code, ds_math, ds_arc)
-        for _ in range(start_step // 3): next(combined, None)
-        for code, math, arc in combined:
-            yield ("code", code); yield ("math", math); yield ("arc", arc)
+    def code_generator():
+        # Cycle entrelacé
+        combined = zip(ds_lcb, ds_mbpp)
+        for _ in range(start_step // 2): next(combined, None)
+        for lcb, mbpp in combined:
+            yield ("lcb", lcb); yield ("mbpp", mbpp)
 
     print(f"\nStarting Darwinian Loop from Step {start_step}...")
-    for relative_step, (task_type, data) in enumerate(triple_generator()):
+    for relative_step, (task_type, data) in enumerate(code_generator()):
         step = start_step + relative_step
         archi.mutate()
         
-        if task_type == "code":
-            prompt, sys_msg = data["question_content"], "You are an expert programmer. Solve the task by reading from stdin and writing to stdout. Output code only."
-        elif task_type == "math":
-            prompt, sys_msg = data["question"], "You are an expert mathematician. Solve the problem step by step and end with #### number."
-        else: # AI2_ARC
-            choices_text = ""
-            for label, text in zip(data['choices']['label'], data['choices']['text']):
-                choices_text += f"{label}: {text}\n"
-            prompt = f"Question: {data['question']}\nChoices:\n{choices_text}\nAnswer:"
-            sys_msg = "You are a science expert. Choose the correct option label (A, B, C, or D). Output only the label."
+        if task_type == "lcb":
+            prompt = data["question_content"]
+            sys_msg = "You are an expert programmer. Solve the complex algorithmic task by reading from stdin and writing to stdout. Output Python code only."
+        else: # MBPP
+            prompt = f"Task: {data['text']}\nEnsure the function is named exactly as expected by these assertions: {data['test_list']}"
+            sys_msg = "You are an expert Python programmer. Write a simple Python function to solve the task. Output Python code only."
             
         messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
         full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -205,25 +195,24 @@ def run_phase6_zero_backprop():
             gen_outputs = llm_model.generate(
                 inputs_embeds=inputs_embeds, 
                 attention_mask=extended_mask, 
-                max_new_tokens=400 if task_type == "code" else 100, 
+                max_new_tokens=500 if task_type == "lcb" else 200, 
                 do_sample=True, 
                 temperature=0.2, 
                 pad_token_id=tokenizer.eos_token_id
             )
             generated_text = tokenizer.decode(gen_outputs[0][inputs_embeds.shape[1]:], skip_special_tokens=True)
             
-        if task_type == "code": reward = execute_lcb_reward(generated_text, data["public_test_cases"])
-        elif task_type == "math": reward = execute_math_reward(generated_text, data["answer"])
-        else: reward = execute_ai2_arc_reward(generated_text, data["answerKey"])
+        if task_type == "lcb": reward = execute_lcb_reward(generated_text, data["public_test_cases"])
+        else: reward = execute_mbpp_reward(generated_text, data["test_list"])
 
         archi.evolution_step(reward)
         archi.moe.distribute_reward(reward)
         
         if (step + 1) % 50 == 0: archi.save_checkpoint(checkpoint_path, step + 1, expert_usage)
-        if (step + 1) % 15 == 0:
+        if (step + 1) % 10 == 0:
             print(f"\n--- Step {step+1} ---")
             print(f"Task: {task_type.upper()} | Reward: {reward} | [ZERO BACKPROP]")
-            print(f"Usage: Code {expert_usage['code']} | Math {expert_usage['math']} | ARC {expert_usage['arc']}")
+            print(f"Usage: LCB Algorithmic {expert_usage['lcb']} | MBPP Basic Python {expert_usage['mbpp']}")
 
 if __name__ == '__main__':
     run_phase6_zero_backprop()
