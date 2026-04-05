@@ -104,9 +104,8 @@ def run_phase5_qwen():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_experts = 3
     
-    # Qwen2.5-Coder-32B est natif dans transformers (pas de trust_remote_code nécessaire)
-    # C'est le Sweet Spot absolu pour une A100 80GB (tient en BF16 avec du contexte)
-    model_name = "Qwen/Qwen2.5-Coder-32B-Instruct"
+    # Qwen3.5-Coder-32B est le SOTA absolu en avril 2026
+    model_name = "Qwen/Qwen3.5-Coder-32B-Instruct"
     print(f"Loading Native SOTA Base LLM: {model_name} (Frozen)")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
