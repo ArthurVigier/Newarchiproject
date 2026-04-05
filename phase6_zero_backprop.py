@@ -109,29 +109,32 @@ def execute_lcb_reward(generated_code: str, test_cases_str: str, timeout=5) -> f
 
 def execute_math_reward(generated_text: str, target_str: str) -> float:
     try:
-        target_val = float(target_str.split("####")[-1].replace(',', '').strip())
+        target_ans = target_str.split("####")[-1].strip()
+        target_val = float(target_ans.replace(',', ''))
         gen_nums = re.findall(r'-?\d+(?:\.\d+)?', generated_text.replace(',', ''))
         if not gen_nums: return -1.0
-        if abs(float(gen_nums[-1]) - target_val) < 1e-5: return 1.0
+        gen_val = float(gen_nums[-1])
+        if abs(gen_val - target_val) < 1e-5: return 1.0
         return -1.0
-    except: return -1.0
+    except Exception: return -1.0
 
-def execute_arc_reward(generated_text: str, expected_output: str) -> float:
+def execute_ai2_arc_reward(generated_text: str, correct_answer_key: str) -> float:
+    """Reward pour allenai/ai2_arc (choix multiple)"""
     try:
-        match = re.search(r'\[\[.*\]\]', generated_text, re.DOTALL)
-        if not match: return -1.0
-        gen_grid = json.loads(match.group(0))
-        target_grid = json.loads(expected_output)
-        if gen_grid == target_grid: return 1.0
+        gen = generated_text.strip().upper()
+        # On cherche la lettre de la réponse isolée
+        match = re.search(r'\b' + correct_answer_key + r'\b', gen)
+        if match: return 1.0
         return -1.0
     except: return -1.0
 
 def load_triple_datasets():
-    print("Loading Triple Curriculum Datasets (Code + Math + ARC)...")
+    print("Loading Triple Curriculum Datasets (Code + Math + AI2_ARC)...")
     ds_code = load_dataset("livecodebench/code_generation", split="test")
     ds_math = load_dataset("openai/gsm8k", "main", split="test")
-    # Dataset officiel ARC de François Chollet
-    ds_arc = load_dataset("fchollet/ARC", split="test")
+    # AI2 ARC Challenge
+    ds_arc = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test")
+    print(f"Loaded {len(ds_code)} Code, {len(ds_math)} Math, {len(ds_arc)} ARC problems.")
     return ds_code, ds_math, ds_arc
 
 def run_phase6_zero_backprop():
@@ -144,8 +147,11 @@ def run_phase6_zero_backprop():
     llm_model.eval()
     for param in llm_model.parameters(): param.requires_grad = False
         
-    llm_hidden_dim = llm_model.config.hidden_size
-    archi = ZeroBackpropArchitecture(llm_hidden_dim=llm_hidden_dim, num_experts=num_experts).to(device)
+    llm_hidden_dim = llm_model.config.hidden_size # 5120
+    LAYER_IDX = 9
+
+    print("Initializing 100% Zero-Backprop Evolutionary Architecture...")
+    archi = ZeroBackpropArchitecture(llm_hidden_dim=llm_hidden_dim, latent_dim=512, num_experts=num_experts).to(device)
     
     ds_code, ds_math, ds_arc = load_triple_datasets()
     expert_usage = {"code": [0]*num_experts, "math": [0]*num_experts, "arc": [0]*num_experts}
@@ -170,9 +176,12 @@ def run_phase6_zero_backprop():
             prompt, sys_msg = data["question_content"], "You are an expert programmer. Solve the task by reading from stdin and writing to stdout. Output code only."
         elif task_type == "math":
             prompt, sys_msg = data["question"], "You are an expert mathematician. Solve the problem step by step and end with #### number."
-        else:
-            # Adaptation structure fchollet/ARC
-            prompt, sys_msg = f"Solve this ARC puzzle. Input: {data['train']}", "Output only the predicted JSON grid [[...]]."
+        else: # AI2_ARC
+            choices_text = ""
+            for label, text in zip(data['choices']['label'], data['choices']['text']):
+                choices_text += f"{label}: {text}\n"
+            prompt = f"Question: {data['question']}\nChoices:\n{choices_text}\nAnswer:"
+            sys_msg = "You are a science expert. Choose the correct option label (A, B, C, or D). Output only the label."
             
         messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
         full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -180,7 +189,7 @@ def run_phase6_zero_backprop():
         
         with torch.no_grad():
             outputs = llm_model(**inputs, output_hidden_states=True)
-            h_t = outputs.hidden_states[9][:, -1, :].to(torch.float32)
+            h_t = outputs.hidden_states[LAYER_IDX][:, -1, :].to(torch.float32)
             soft_token = archi(h_t)
             
             active_expert = archi.moe._last_selected_experts[0].item()
@@ -193,12 +202,19 @@ def run_phase6_zero_backprop():
             inputs_embeds = torch.cat([soft_token_bf16, text_embeds], dim=1)
             extended_mask = torch.cat([torch.ones((1, 1), device=device), inputs["attention_mask"]], dim=1)
             
-            gen_outputs = llm_model.generate(inputs_embeds=inputs_embeds, attention_mask=extended_mask, max_new_tokens=400, do_sample=True, temperature=0.2, pad_token_id=tokenizer.eos_token_id)
+            gen_outputs = llm_model.generate(
+                inputs_embeds=inputs_embeds, 
+                attention_mask=extended_mask, 
+                max_new_tokens=400 if task_type == "code" else 100, 
+                do_sample=True, 
+                temperature=0.2, 
+                pad_token_id=tokenizer.eos_token_id
+            )
             generated_text = tokenizer.decode(gen_outputs[0][inputs_embeds.shape[1]:], skip_special_tokens=True)
             
         if task_type == "code": reward = execute_lcb_reward(generated_text, data["public_test_cases"])
         elif task_type == "math": reward = execute_math_reward(generated_text, data["answer"])
-        else: reward = execute_arc_reward(generated_text, json.dumps(data['test'][0]['output'])) # fchollet/ARC
+        else: reward = execute_ai2_arc_reward(generated_text, data["answerKey"])
 
         archi.evolution_step(reward)
         archi.moe.distribute_reward(reward)
