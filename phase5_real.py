@@ -15,7 +15,7 @@ import itertools
 _orig_getattr = nn.Module.__getattr__
 def _patched_getattr(self, name):
     if name == "all_tied_weights_keys":
-        return []
+        return {} # Doit être un dictionnaire, pas une liste !
     return _orig_getattr(self, name)
 nn.Module.__getattr__ = _patched_getattr
 
