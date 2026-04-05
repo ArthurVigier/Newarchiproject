@@ -1,0 +1,58 @@
+{
+  "project": "Architecture LLM Expérimentale sans Backpropagation",
+  "status": "Phase 0 & Phase 2 Validation Complete",
+  "date": "2026-04-05",
+  "environment": "Local M1 Mac (16GB RAM) + Ollama",
+  "test_results": [
+    {
+      "phase": "0.4",
+      "name": "XOR Survival (Darwinian Learning)",
+      "goal": "Verify that neurons can learn XOR logic using only survival/death rules without any gradient descent.",
+      "result": "PASSED",
+      "metrics": {
+        "final_accuracy": 1.0,
+        "convergence_step": 700,
+        "total_deaths": 58
+      },
+      "artifact": "phase0_step04_xor.py"
+    },
+    {
+      "phase": "0.2",
+      "name": "SIGReg Convergence (Anti-Collapse)",
+      "goal": "Ensure SIGReg (Sketch Isotropic Gaussian Regularizer) converges monotonically on high-anisotropy embeddings.",
+      "result": "PASSED",
+      "metrics": {
+        "initial_loss": 25.02,
+        "final_loss": 17.66,
+        "trend": "Strictly Monotonic (10/10 segments)"
+      },
+      "artifact": "phase0_step02_sigreg.py"
+    },
+    {
+      "phase": "0.3",
+      "name": "Internal Activations AUC",
+      "goal": "Verify if internal hidden states (Layer 9) of a code-specialized model can predict if a code is valid (Pass/Fail).",
+      "model": "Qwen/Qwen2.5-Coder-0.5B",
+      "result": "PASSED",
+      "metrics": {
+        "layer_9_auc": 0.8333,
+        "layer_12_auc": 0.8889,
+        "layer_16_auc": 0.9722
+      },
+      "artifact": "phase0_step03_auc.py"
+    },
+    {
+      "phase": "2.0",
+      "name": "Survival MoE Architecture Integrity",
+      "goal": "Technical verification of the Mixture of Experts with Darwinian neurons and Entropy-based routing.",
+      "result": "PASSED",
+      "metrics": {
+        "tensor_flow": "Correct (Output: [Batch, 512])",
+        "reward_distribution": "Functional (No backprop required)",
+        "routing_logic": "MC Dropout Variance based"
+      },
+      "artifact": "phase2_survival_moe.py"
+    }
+  ],
+  "conclusion": "The empirical foundation of the project is solid. Darwinian survival works, SIGReg prevents collapse, and model activations contain the necessary signal for introspection. Ready for Phase 4 (Introspection Projector) and high-compute training."
+}
