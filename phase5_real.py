@@ -124,9 +124,26 @@ def run_phase5_glm():
     
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    # Patch for GLM-4: remote code expects max_length but config has seq_length
-    if not hasattr(config, 'max_length'):
-        config.max_length = getattr(config, 'seq_length', 131072)
+    
+    # --- SUPER PATCH CONFIG GLM-4 ---
+    # Anticipation de tous les attributs manquants dans ChatGLMConfig
+    # exigés par les versions récentes de transformers (GenerationMixin, forward_impl)
+    config_patches = {
+        'max_length': getattr(config, 'seq_length', 131072),
+        'use_cache': True,
+        'is_encoder_decoder': False,
+        'output_hidden_states': True,
+        'return_dict': True,
+        'tie_word_embeddings': False,
+        'chunk_size_feed_forward': 0,
+        'pruned_heads': {},
+        'output_attentions': False
+    }
+    
+    for key, value in config_patches.items():
+        if not hasattr(config, key):
+            setattr(config, key, value)
+    # --------------------------------
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     llm_model = AutoModelForCausalLM.from_pretrained(
