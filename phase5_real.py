@@ -114,9 +114,16 @@ def run_phase5_glm():
     model_name = "THUDM/glm-4-9b-chat"
     print(f"Loading Base LLM: {model_name} (Frozen)")
     
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    # Patch for GLM-4: remote code expects max_length but config has seq_length
+    if not hasattr(config, 'max_length'):
+        config.max_length = getattr(config, 'seq_length', 131072)
+    
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     llm_model = AutoModelForCausalLM.from_pretrained(
         model_name, 
+        config=config,
         device_map="auto", 
         torch_dtype=torch.bfloat16,
         trust_remote_code=True
